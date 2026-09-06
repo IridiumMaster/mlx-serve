@@ -516,20 +516,7 @@ pub const HotPrefixCache = struct {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
 
-            var max_shared = @min(e.tokens.len, prompt_ids.len);
-            if (e.vision_key != vision_key) {
-                // Placeholder token IDs do not encode media pixels. Once an
-                // image/audio/video row is forwarded, model state depends on
-                // the media hash and cannot cross keys. State strictly before
-                // the first such row remains ordinary text.
-                const safe_boundary = if (e.media_start) |entry_start|
-                    if (media_start) |request_start| @min(entry_start, request_start) else entry_start
-                else
-                    media_start orelse continue;
-                max_shared = @min(max_shared, safe_boundary);
-            }
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
+            const shared = mediaSharedPrefix(e, prompt_ids, vision_key, media_start) orelse continue;
 
             // Record the RAW match before the restorability filter can drop
             // this candidate — a null return with a long raw match is the
@@ -624,8 +611,10 @@ pub const HotPrefixCache = struct {
         // the tier persists per-position SSM checkpoints beside the KV chunks
         // and restores both.
         if (self.disk) |*d| disk: {
-            if (vision_key != 0) break :disk;
-            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse break :disk;
+            // Disk entries contain text only. Even coincidentally equal
+            // placeholder IDs must never extend a disk hit into this image.
+            const disk_ids = if (vision_key == 0) prompt_ids else prompt_ids[0..@min(prompt_ids.len, media_start orelse break :disk)];
+            const dm = d.bestMatch(disk_ids, has_tools, target_cache.config) orelse break :disk;
 
             if (target_ssm_entries) |ssm_entries| {
                 // Hybrid: compare EFFECTIVE restorable positions — the largest
@@ -1045,7 +1034,7 @@ pub const HotPrefixCache = struct {
         // resident, so this costs GPU memory only in the accounting, and only
         // until the donor is evicted.
         if (replace_idx == null) inherit: {
-            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, vision_key, quant_config) orelse
+            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, vision_key, eff_media_start, quant_config) orelse
                 break :inherit;
             const budget: ?u64 = if (self.max_kv_bytes == 0)
                 null
@@ -1360,6 +1349,22 @@ pub const HotPrefixCache = struct {
         return owned;
     }
 
+    /// Lookup and checkpoint inheritance share the same media boundary: token
+    /// equality alone cannot establish equal state after a placeholder row.
+    fn mediaSharedPrefix(e: *const Entry, tokens: []const u32, vision_key: u64, media_start: ?usize) ?usize {
+        var limit = @min(e.tokens.len, tokens.len);
+        if (e.vision_key != vision_key) {
+            const boundary = if (e.media_start) |old|
+                if (media_start) |new| @min(old, new) else old
+            else
+                media_start orelse return null;
+            limit = @min(limit, boundary);
+        }
+        var shared: usize = 0;
+        while (shared < limit and e.tokens[shared] == tokens[shared]) shared += 1;
+        return shared;
+    }
+
     /// The resident entry whose checkpoints a commit of `tokens` may inherit:
     /// the key-compatible entry maximizing the highest checkpoint at or below
     /// its shared prefix with `tokens`. Returns that entry's index and the
@@ -1381,6 +1386,7 @@ pub const HotPrefixCache = struct {
         tokens: []const u32,
         has_tools: bool,
         vision_key: u64,
+        media_start: ?usize,
         quant_config: kv_quant.KVQuantConfig,
     ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
@@ -1388,12 +1394,9 @@ pub const HotPrefixCache = struct {
         var best_pos: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
-            if (e.vision_key != vision_key) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             const cps = e.ssm_checkpoints orelse continue;
-            const max_shared = @min(e.tokens.len, tokens.len);
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == tokens[shared]) shared += 1;
+            const shared = mediaSharedPrefix(e, tokens, vision_key, media_start) orelse continue;
             const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
             if (cp.pos > best_pos) {
                 best_pos = cp.pos;
@@ -3046,6 +3049,116 @@ test "prefix cache: a hybrid miss with a raw token match names itself" {
     try testing.expectEqual(MissKind.no_checkpoint, missKind(4, 393_000));
 }
 
+test "HotPrefixCache: changed media inherits only safe checkpoints after donor eviction" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 900, 900, 9, 10, 11, 12 };
+    // Image -> image, text -> image, and image -> text. The earliest media
+    // row is 6 even when the new image moves later in the rendered prompt.
+    const cases = [_]struct { old: u64, new: u64, old_start: ?usize, new_start: ?usize, inherits: bool = true }{
+        .{ .old = 11, .new = 22, .old_start = 6, .new_start = 9 },
+        .{ .old = 0, .new = 22, .old_start = null, .new_start = 6 },
+        .{ .old = 11, .new = 0, .old_start = 6, .new_start = null },
+        .{ .old = 11, .new = 22, .old_start = null, .new_start = null, .inherits = false },
+        .{ .old = 11, .new = 22, .old_start = 6, .new_start = 0, .inherits = false },
+    };
+    for (cases) |c| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 1, 0);
+        defer hc.deinit();
+        hc.qsa_history_required = true;
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, tokens.len);
+        var old = pcBuildQsaHybrid(s, 8, 100.0);
+        defer pcFreeQsaHybrid(&old);
+        const a = try testing.allocator.alloc(SSMCheckpoint, 2);
+        a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &old, 4, s);
+        a[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &old, 8, s);
+        try transformer_mod.attachQsaHistoryToLatest(a, &old, s);
+        try hc.commitWithMediaState(&cache, &tokens, false, c.old, c.old_start, a, null, null);
+
+        var current = pcBuildQsaHybrid(s, 10, 200.0);
+        defer pcFreeQsaHybrid(&current);
+        const b = try testing.allocator.alloc(SSMCheckpoint, 1);
+        b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &current, 10, s);
+        try transformer_mod.attachQsaHistoryToLatest(b, &current, s);
+        try hc.commitWithMediaState(&cache, &tokens, false, c.new, c.new_start, b, null, null);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqual(c.new, hc.entries.items[0].vision_key);
+        const kept = hc.entries.items[0].ssm_checkpoints.?;
+        if (!c.inherits) {
+            try testing.expectEqual(@as(usize, 1), kept.len);
+            try testing.expectEqual(@as(usize, 10), kept[0].pos);
+            continue;
+        }
+        try testing.expectEqual(@as(usize, 2), kept.len);
+        try testing.expectEqual(@as(usize, 4), kept[0].pos);
+        try testing.expectEqual(@as(usize, 10), kept[1].pos);
+
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var off: usize = 0;
+        const r = try hc.lookupAndRestoreWithMedia(&target_cache, &off, &target, s, &tokens, false, 33, 6, null, null);
+        try testing.expectEqual(@as(usize, 4), r.matched);
+        try testing.expectEqual(@as(f32, 100.0), pcSsmVal(target[1].conv_state, 0, s));
+        try testing.expectEqual(@as(c_int, 4), mlx.getShape(target[0].aux_state)[1]);
+    }
+}
+
+test "HotPrefixCache: image requests restore only pre-media text from SSD" {
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..len];
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+        defer hc.deinit();
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "media-text", 0, 128);
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, tokens.len);
+        var source = pcBuildQsaHybrid(s, 512, 100.0);
+        defer pcFreeQsaHybrid(&source);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source, 256, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source, 512, s);
+        try transformer_mod.attachQsaHistoryToLatest(cps, &source, s);
+        try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "media-text", 0, 128);
+    // Equal token IDs beyond the boundary are deliberate: they cannot prove
+    // equal pixels. Unknown/zero boundaries must stay cold on both paths.
+    for ([_]?usize{ 300, null, 0 }) |boundary| {
+        for ([_]bool{ false, true }) |hybrid| {
+            var cache = try KVCache.init(testing.allocator, 3);
+            defer cache.deinit();
+            var target = pcEmptySsm();
+            defer pcFreeQsaHybrid(&target);
+            var off: usize = 0;
+            const r = try hc.lookupAndRestoreWithMedia(&cache, &off, if (hybrid) &target else null, s, &tokens, false, 99, boundary, null, null);
+            const expected: usize = if (boundary != null and boundary.? == 300) (if (hybrid) 256 else 300) else 0;
+            try testing.expectEqual(expected, r.matched);
+            try testing.expectEqual(expected, off);
+            try testing.expect(!r.full_match);
+            if (hybrid and expected > 0) {
+                try testing.expectEqual(@as(c_int, 256), mlx.getShape(target[0].aux_state)[1]);
+                try testing.expectEqual(@as(f32, 100.0), pcSsmVal(target[1].conv_state, 0, s));
+            }
+        }
+    }
+}
+
 test "prefix cache: the no-match lookup arm consults missKind, never returns silently" {
     // Class guard for the 560 s unexplained cold prefill: every early return
     // from the lookup owes a reason. The `match == null` arm is the one that
@@ -3068,7 +3181,6 @@ test "prefix cache: the no-match lookup arm consults missKind, never returns sil
         return error.MissingFilter;
     try testing.expect(probe_at < filter_at);
 }
-
 
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {
     // The two claims inheritance rests on. (1) Sharing: a clone must outlive
@@ -3149,4 +3261,3 @@ test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is bu
     try testing.expectEqual(@as(f32, 200.0), pcSsmVal(dst[0].conv_state, 0, s));
     try testing.expectEqual(@as(f32, 1000.0), pcSsmVal(dst[0].ssm_state, 0, s));
 }
-
