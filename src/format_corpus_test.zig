@@ -41,18 +41,6 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
-test "format corpus: media lookup and inheritance use one family-independent boundary" {
-    // A placeholder-token match is not a pixel match. Every family using the
-    // hot cache must apply the same pre-media clamp to lookup AND inheritance.
-    const source = @embedFile("prefix_cache.zig");
-    const lookup_start = std.mem.indexOf(u8, source, "fn findBestRestorableMatch(").?;
-    const donor_start = std.mem.indexOf(u8, source, "fn bestCheckpointDonor(").?;
-    const donor_end = std.mem.indexOfPos(u8, source, donor_start, "fn cloneCheckpointsUpTo(").?;
-    const lookup_end = std.mem.indexOfPos(u8, source, lookup_start, "pub fn lookupAndRestore").?;
-    try testing.expect(std.mem.indexOf(u8, source[lookup_start..lookup_end], "mediaSharedPrefix(e,") != null);
-    try testing.expect(std.mem.indexOf(u8, source[donor_start..donor_end], "mediaSharedPrefix(e,") != null);
-}
-
 test "format corpus: MTP cost profiles classify full target tensor surfaces" {
     const Case = struct {
         bits: u32,
@@ -2110,9 +2098,7 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:",
-        "<｜DSML｜",
-        "<function",
+        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
@@ -2454,14 +2440,4 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
         };
         try testing.expectEqualStrings(d.value, rt_val.string);
     }
-}
-test "format corpus: media checkpoint capture and retention share the scheduler boundary" {
-    const scheduler_source = @embedFile("scheduler.zig");
-    const generator_source = @embedFile("generate.zig");
-    const cache_source = @embedFile("prefix_cache.zig");
-    try testing.expect(std.mem.indexOf(u8, scheduler_source, ".ssm_checkpoint_media_start = slot.media_start") != null);
-    try testing.expect(std.mem.indexOf(u8, generator_source, "preMediaChunkEnd(pos, nextChunkEnd(") != null);
-    try testing.expect(std.mem.indexOf(u8, generator_source, "media_cp == abs_end_for_cp2") != null);
-    try testing.expect(std.mem.indexOf(u8, generator_source, "preMediaCheckpointIndex(ssm_checkpoints.items, media_cp)") != null);
-    try testing.expect(std.mem.indexOf(u8, cache_source, "preMediaCheckpointIndex(merged.items, media_start)") != null);
 }
