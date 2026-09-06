@@ -10,6 +10,10 @@ avoidable replay. Short alternating-image tests did not expose the gap.
 The generator now cuts a chunk at the active media start and captures the
 state BEFORE consuming any media row. Its bounded per-prefill list and the
 hot cache's merged list preserve the nearest checkpoint at/before that row.
+The boundary includes an adjacent configured opening marker (Qwen vision
+start, BOI or BOA): demoting media removes that marker as well as the pixels.
+A pixel-only boundary missed the usable prefix by one token in the live test,
+so its otherwise protected checkpoint was unreachable on the next image.
 The latest snapshot remains available for ordinary continuation and QSA
 history. The count/byte budgets still apply: a one-checkpoint budget cannot
 keep both anchors and keeps the latest; oversized-entry trimming is unchanged.

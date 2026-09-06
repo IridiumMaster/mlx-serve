@@ -317,11 +317,19 @@ fn firstMediaPlaceholder(
     image_token_id: u32,
     audio_token_id: u32,
     video_token_id: u32,
+    opening_ids: []const u32,
 ) ?usize {
     for (tokens, 0..) |token, i| {
         if ((image_token_id > 0 and token == image_token_id) or
             (audio_token_id > 0 and token == audio_token_id) or
-            (video_token_id > 0 and token == video_token_id)) return i;
+            (video_token_id > 0 and token == video_token_id))
+        {
+            // Demoting media removes its opening marker too. A checkpoint
+            // after that marker is already beyond the next shared prefix.
+            if (i > 0 and tokens[i - 1] > 0 and std.mem.indexOfScalar(u32, opening_ids, tokens[i - 1]) != null)
+                return i - 1;
+            return i;
+        }
     }
     return null;
 }
@@ -556,6 +564,7 @@ pub const Slot = struct {
             config.image_token_id,
             config.audio_token_id,
             config.video_token_id,
+            &.{ if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id, config.boa_token_id },
         );
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
@@ -5876,11 +5885,21 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
     const tokens = [_]u32{ 0, 11, 22, 33, 44 };
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0));
-    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0));
-    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44));
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22));
-    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0) == null);
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0, &.{}));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0, &.{}));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44, &.{}));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22, &.{}));
+    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0, &.{11}) == null);
+}
+
+test "media checkpoint includes an adjacent opening marker removed with the pixels" {
+    const tokens = [_]u32{ 9, 55, 22, 22, 66 };
+    try testing.expectEqual(@as(?usize, 1), firstMediaPlaceholder(&tokens, 22, 0, 0, &.{55}));
+    try testing.expectEqual(@as(?usize, 1), firstMediaPlaceholder(&tokens, 0, 0, 22, &.{55}));
+    try testing.expectEqual(@as(?usize, 1), firstMediaPlaceholder(&tokens, 0, 22, 0, &.{ 0, 55 }));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0, &.{9}));
+    try testing.expectEqual(@as(?usize, 0), firstMediaPlaceholder(&.{22}, 22, 0, 0, &.{55}));
+    try testing.expectEqual(@as(?usize, 1), firstMediaPlaceholder(&.{ 0, 22 }, 22, 0, 0, &.{0}));
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
