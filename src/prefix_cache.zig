@@ -1049,7 +1049,7 @@ pub const HotPrefixCache = struct {
             }) orelse break :inherit;
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                eff_cps = self.mergeCheckpointLists(cloned, own) catch |err| {
+                eff_cps = self.mergeCheckpointLists(cloned, own, eff_media_start) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     break :inherit;
@@ -1090,7 +1090,7 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new);
+                break :blk try self.mergeCheckpointLists(old, new, eff_media_start);
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -1279,6 +1279,7 @@ pub const HotPrefixCache = struct {
         self: *HotPrefixCache,
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
+        media_start: ?usize,
     ) ![]SSMCheckpoint {
         var merged = std.ArrayList(SSMCheckpoint).empty;
         var i: usize = 0;
@@ -1327,10 +1328,14 @@ pub const HotPrefixCache = struct {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
             const drop = if (merged.items.len < 3) 0 else blk2: {
-                var best_at: usize = 1;
+                const protected = transformer_mod.preMediaCheckpointIndex(merged.items, media_start);
+                // With a two-snapshot budget, the media anchor and latest
+                // state outrank the generic first snapshot.
+                var best_at: usize = 0;
                 var best_span: usize = std.math.maxInt(usize);
                 var k: usize = 1;
                 while (k + 1 < merged.items.len) : (k += 1) {
+                    if (protected == k) continue;
                     const span = merged.items[k + 1].pos - merged.items[k - 1].pos;
                     if (span < best_span) {
                         best_span = span;
@@ -3103,6 +3108,44 @@ test "HotPrefixCache: changed media inherits only safe checkpoints after donor e
         try testing.expectEqual(@as(usize, 4), r.matched);
         try testing.expectEqual(@as(f32, 100.0), pcSsmVal(target[1].conv_state, 0, s));
         try testing.expectEqual(@as(c_int, 4), mlx.getShape(target[0].aux_state)[1]);
+    }
+}
+
+test "HotPrefixCache: long tool text retains the pre-media checkpoint under thinning" {
+    const s = mlx.gpuStream();
+    for ([_]u32{ 1, 2, 3, 8 }) |cap| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 1, 0);
+        defer hc.deinit();
+        hc.ssm_checkpoint_max = cap;
+        hc.qsa_history_required = true;
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        var tokens: [24]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
+        try testFillCache(&cache, s, 3, tokens.len);
+        var source = pcBuildQsaHybrid(s, 24, 100.0);
+        defer pcFreeQsaHybrid(&source);
+        const a = try testing.allocator.alloc(SSMCheckpoint, 3);
+        for ([_]usize{ 4, 6, 8 }, 0..) |pos, i|
+            a[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source, pos, s);
+        try transformer_mod.attachQsaHistoryToLatest(a, &source, s);
+        try hc.commitWithMediaState(&cache, tokens[0..10], false, 11, 6, a, null, null);
+        const b = try testing.allocator.alloc(SSMCheckpoint, 3);
+        for ([_]usize{ 16, 20, 24 }, 0..) |pos, i|
+            b[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &source, pos, s);
+        try transformer_mod.attachQsaHistoryToLatest(b, &source, s);
+        try hc.commitWithMediaState(&cache, &tokens, false, 11, 6, b, null, null);
+        const retained = hc.entries.items[0].ssm_checkpoints.?;
+        try testing.expect(retained.len <= cap);
+        try testing.expectEqual(@as(usize, 24), retained[retained.len - 1].pos);
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var off: usize = 0;
+        const r = try hc.lookupAndRestoreWithMedia(&cache, &off, &target, s, &tokens, false, 22, 22, null, null);
+        // The raw match ends at the old image. A checkpoint at 6 exists and is
+        // safe; spacing-based thinning must not turn it into a fallback at 4.
+        try testing.expectEqual(@as(usize, if (cap == 1) 0 else 6), r.matched);
+        if (cap > 1) try testing.expectEqual(@as(c_int, 6), mlx.getShape(target[0].aux_state)[1]);
     }
 }
 

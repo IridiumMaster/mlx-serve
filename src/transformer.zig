@@ -5528,6 +5528,31 @@ pub const SSMCheckpoint = struct {
     }
 };
 
+/// State at the media row has not consumed the image yet. Keep the nearest
+/// such checkpoint when thinning, so changing pixels has a cheap safe anchor.
+pub fn preMediaCheckpointIndex(checkpoints: []const SSMCheckpoint, media_start: ?usize) ?usize {
+    const boundary = media_start orelse return null;
+    var best: ?usize = null;
+    for (checkpoints, 0..) |cp, i| {
+        if (cp.pos <= boundary and (best == null or cp.pos > checkpoints[best.?].pos)) best = i;
+    }
+    return best;
+}
+
+test "pre-media checkpoint is nearest safe state, never foreign image state" {
+    const cps = [_]SSMCheckpoint{
+        .{ .pos = 4, .layers = &.{} },
+        .{ .pos = 6, .layers = &.{} },
+        .{ .pos = 8, .layers = &.{} },
+    };
+    try std.testing.expect(preMediaCheckpointIndex(&cps, null) == null);
+    try std.testing.expect(preMediaCheckpointIndex(&cps, 0) == null);
+    try std.testing.expectEqual(@as(?usize, 0), preMediaCheckpointIndex(&cps, 5));
+    try std.testing.expectEqual(@as(?usize, 1), preMediaCheckpointIndex(&cps, 6));
+    try std.testing.expectEqual(@as(?usize, 1), preMediaCheckpointIndex(&cps, 7));
+    try std.testing.expectEqual(@as(?usize, 2), preMediaCheckpointIndex(&cps, 20));
+}
+
 /// Snapshot of every entry in `ssm_entries` at the current point. Caller owns
 /// the resulting buffer (free via `SSMCheckpoint.deinit`).
 ///

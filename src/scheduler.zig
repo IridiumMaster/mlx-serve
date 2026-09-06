@@ -5392,6 +5392,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            .ssm_checkpoint_media_start = slot.media_start,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
             .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)

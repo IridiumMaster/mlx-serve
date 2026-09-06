@@ -1,5 +1,26 @@
 # Engine: KV cache, spec-decode, kernels, MLX/FFI — war stories (moved out of CLAUDE.md)
 
+## Long tool text thinned away the active image's safe checkpoint (2026-09-06)
+
+A DeepSeek Harness image → long tool text → new image sequence reached a
+193,990-token prompt. The token match stopped at the prior image (167,991),
+but the nearest restorable checkpoint was 142,782: another 25,209 tokens of
+avoidable replay. Short alternating-image tests did not expose the gap.
+
+The generator now cuts a chunk at the active media start and captures the
+state BEFORE consuming any media row. Its bounded per-prefill list and the
+hot cache's merged list preserve the nearest checkpoint at/before that row.
+The latest snapshot remains available for ordinary continuation and QSA
+history. The count/byte budgets still apply: a one-checkpoint budget cannot
+keep both anchors and keeps the latest; oversized-entry trimming is unchanged.
+
+This does not permit reuse past changed pixels. The server currently selects
+only the latest active media message, so replacing an older image's rows still
+invalidates its suffix. Likewise, client history compaction changes the prefix.
+Neither replay can safely be removed by ignoring media keys. Regression:
+`test_vision_cache_retention.sh ... interleaved`, plus the thinning/absolute
+boundary unit tests and capture-wiring class guard.
+
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
 ### KV cache after tool calls

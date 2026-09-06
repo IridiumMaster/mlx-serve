@@ -2455,3 +2455,13 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
         try testing.expectEqualStrings(d.value, rt_val.string);
     }
 }
+test "format corpus: media checkpoint capture and retention share the scheduler boundary" {
+    const scheduler_source = @embedFile("scheduler.zig");
+    const generator_source = @embedFile("generate.zig");
+    const cache_source = @embedFile("prefix_cache.zig");
+    try testing.expect(std.mem.indexOf(u8, scheduler_source, ".ssm_checkpoint_media_start = slot.media_start") != null);
+    try testing.expect(std.mem.indexOf(u8, generator_source, "preMediaChunkEnd(pos, nextChunkEnd(") != null);
+    try testing.expect(std.mem.indexOf(u8, generator_source, "media_cp == abs_end_for_cp2") != null);
+    try testing.expect(std.mem.indexOf(u8, generator_source, "preMediaCheckpointIndex(ssm_checkpoints.items, media_cp)") != null);
+    try testing.expect(std.mem.indexOf(u8, cache_source, "preMediaCheckpointIndex(merged.items, media_start)") != null);
+}

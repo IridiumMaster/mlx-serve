@@ -764,6 +764,12 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
+pub fn preMediaChunkEnd(pos: usize, end: usize, offset: usize, media_start: ?usize) usize {
+    const boundary = media_start orelse return end;
+    if (boundary > pos + offset and boundary < end + offset) return boundary - offset;
+    return end;
+}
+
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
 /// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
 /// equal images) — so vision prefills skip checkpointing even now that they
@@ -1654,6 +1660,9 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// Absolute start of the active media rows; capture before consuming
+        /// them and preserve that state alongside the latest checkpoint.
+        ssm_checkpoint_media_start: ?usize = null,
         /// Placeholder rows inside a restored prefix (prefix-cache hit on an
         /// image prompt): the vision splice starts here, not at row 0.
         vision_rows_before: usize = 0,
@@ -1950,6 +1959,7 @@ pub const Generator = struct {
         // length so the snapshots stamp positions valid in the full original
         // sequence, not relative offsets inside the tail-only prefill.
         const ssm_cp_offset: usize = options.ssm_checkpoint_pos_offset;
+        const media_cp = if (want_ssm_cp) options.ssm_checkpoint_media_start else null;
 
         // Qwen native MTP: build the head's committed-history KV cache during
         // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -2016,7 +2026,11 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len);
-            const loop_end = prefix_len - snapshot_backoff;
+            var loop_end = prefix_len - snapshot_backoff;
+            if (media_cp) |boundary| {
+                if (boundary > ssm_cp_offset and boundary - ssm_cp_offset <= prefix_len)
+                    loop_end = @max(loop_end, boundary - ssm_cp_offset);
+            }
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
@@ -2068,7 +2082,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                const end = preMediaChunkEnd(pos, nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset), ssm_cp_offset, media_cp);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -2200,7 +2214,9 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                if (want_ssm_cp and ssm_cp_stride > 0 and
+                    (abs_end_for_cp2 % ssm_cp_stride == 0 or media_cp == abs_end_for_cp2))
+                {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     try ssm_checkpoints.append(allocator, cp);
                     // Keep the buffer bounded — drop the oldest if we've
@@ -2212,7 +2228,9 @@ pub const Generator = struct {
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var oldest = ssm_checkpoints.orderedRemove(0);
+                        const drop: usize = if (ssm_checkpoints.items.len > 2 and
+                            transformer_mod.preMediaCheckpointIndex(ssm_checkpoints.items, media_cp) == 0) 1 else 0;
+                        var oldest = ssm_checkpoints.orderedRemove(drop);
                         oldest.deinit(allocator);
                     }
                 }
@@ -2271,7 +2289,9 @@ pub const Generator = struct {
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var oldest = ssm_checkpoints.orderedRemove(0);
+                        const drop: usize = if (ssm_checkpoints.items.len > 2 and
+                            transformer_mod.preMediaCheckpointIndex(ssm_checkpoints.items, media_cp) == 0) 1 else 0;
+                        var oldest = ssm_checkpoints.orderedRemove(drop);
                         oldest.deinit(allocator);
                     }
                 }
@@ -10497,6 +10517,14 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
     try testing.expectEqual(@as(usize, 2 + cycle.len), d.start);
+}
+
+test "pre-media chunk boundary is absolute and never rewinds a restored prefix" {
+    try testing.expectEqual(@as(usize, 19), preMediaChunkEnd(0, 1024, 10000, 10019));
+    for ([_]?usize{ null, 0, 10000, 11024, 12000 }) |boundary|
+        try testing.expectEqual(@as(usize, 1024), preMediaChunkEnd(0, 1024, 10000, boundary));
+    try testing.expectEqual(@as(usize, 1024), preMediaChunkEnd(512, 1024, 10000, 10512));
+    try testing.expectEqual(@as(usize, 700), preMediaChunkEnd(512, 1024, 10000, 10700));
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
