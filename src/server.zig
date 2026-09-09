@@ -16432,6 +16432,7 @@ fn handleResponsesInner(
     // ── parse input → messages ──
     var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
+        if (stream.ws_mode != null) return err;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
     };
@@ -16513,6 +16514,7 @@ fn handleResponsesInner(
     if (config.qwen_vision and lm.vision_encoder != null) {
         const prepared = prepareQwenHistory(allocator, lm, prompt_ids_raw, pi.messages.items, active_tools_json, active_tool_choice_instruction) catch |err| {
             allocator.free(prompt_ids_raw);
+            if (stream.ws_mode != null) return err;
             try sendGenerationError(allocator, stream, err, .openai);
             return;
         };
@@ -18809,7 +18811,6 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 0), cold.shared_resident_bytes);
     try t.expectEqual(@as(u64, 0), cold.grow_coexist_bytes);
 }
-
 
 test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {
     const GB: u64 = 1 << 30;
